@@ -3,7 +3,7 @@
 # deploy.sh — Build & deploy the Stage Regression Alerter
 #
 # Prerequisites:
-#   1. gcloud authenticated:  gcloud auth login && gcloud auth application-default login
+#   1. gcloud authenticated:  gcloud auth login
 #   2. Docker running locally
 #   3. SLACK_BOT_TOKEN env var set with your bot token
 #
@@ -18,11 +18,12 @@ PROJECT_ID="pendo-reporting-ops"
 REGION="us-east1"
 JOB_NAME="stage-regression-alerter"
 IMAGE="us-east1-docker.pkg.dev/${PROJECT_ID}/cloud-run-jobs/${JOB_NAME}"
-SA_NAME="stage-regression-sa"
-SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+# Use the existing default compute SA — no creation or IAM bindings needed
+DEFAULT_SA="${PROJECT_ID//pendo-reporting-ops/265504543930}-compute@developer.gserviceaccount.com"
+DEFAULT_SA="265504543930-compute@developer.gserviceaccount.com"
 SECRET_NAME="stage-regression-slack-token"
 SLACK_CHANNEL="#stage-regression-alerts"
-SCHEDULE="0 9 * * 1-5"        # 9 AM ET, Mon–Fri  (Cloud Scheduler uses UTC; adjust if needed)
+SCHEDULE="0 9 * * 1-5"
 SCHEDULE_TZ="America/New_York"
 # ───────────────────────────────────────────────────────────
 
@@ -35,72 +36,27 @@ fi
 echo "▶  Setting project to ${PROJECT_ID}"
 gcloud config set project "${PROJECT_ID}"
 
-# ── 1. Enable required APIs ─────────────────────────────────
-echo "▶  Enabling required APIs…"
-if ! gcloud services enable \
-  run.googleapis.com \
-  cloudscheduler.googleapis.com \
-  secretmanager.googleapis.com \
-  artifactregistry.googleapis.com \
-  bigquery.googleapis.com \
-  --quiet 2>&1; then
-  echo "⚠️  Could not enable APIs (insufficient permissions)."
-  echo "   Ask a GCP project owner to enable these on ${PROJECT_ID}:"
-  echo "     run.googleapis.com, cloudscheduler.googleapis.com,"
-  echo "     secretmanager.googleapis.com, artifactregistry.googleapis.com"
-  echo "   Continuing — will fail below if APIs aren't already on…"
-fi
-
-# ── 2. Artifact Registry repo ──────────────────────────────
-echo "▶  Ensuring Artifact Registry repo exists…"
+# ── 1. Artifact Registry repo (already exists, just verify) ─
+echo "▶  Verifying Artifact Registry repo…"
 gcloud artifacts repositories describe cloud-run-jobs \
-  --location="${REGION}" --quiet 2>/dev/null || \
-gcloud artifacts repositories create cloud-run-jobs \
-  --repository-format=docker \
-  --location="${REGION}" \
-  --description="Cloud Run job images" \
-  --quiet
+  --location="${REGION}" --quiet
 
-# ── 3. Build & push image (pulls source from GitHub, no GCS staging needed) ─
-echo "▶  Building and pushing Docker image via Cloud Build…"
-gcloud builds submit --no-source \
-  --config=cloudbuild.yaml \
-  --region="${REGION}" \
-  --substitutions="_IMAGE=${IMAGE}" \
-  --quiet
+# ── 2. Build image locally and push to Artifact Registry ───
+echo "▶  Authenticating Docker to Artifact Registry…"
+gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
-# ── 4. Service account ─────────────────────────────────────
-echo "▶  Ensuring service account exists…"
-gcloud iam service-accounts describe "${SA_EMAIL}" --quiet 2>/dev/null || \
-gcloud iam service-accounts create "${SA_NAME}" \
-  --display-name="Stage Regression Alerter" \
-  --quiet
+echo "▶  Building Docker image…"
+docker build --platform linux/amd64 -t "${IMAGE}" .
 
-# Grant BigQuery read access
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/bigquery.dataViewer" \
-  --quiet
+echo "▶  Pushing image to Artifact Registry…"
+docker push "${IMAGE}"
 
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/bigquery.jobUser" \
-  --quiet
-
-# Grant Secret Manager access
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/secretmanager.secretAccessor" \
-  --quiet
-
-# ── 5. Store Slack token in Secret Manager ─────────────────
+# ── 3. Store Slack token in Secret Manager ─────────────────
 echo "▶  Storing Slack bot token in Secret Manager…"
 if gcloud secrets describe "${SECRET_NAME}" --quiet 2>/dev/null; then
-  # Secret exists — add a new version
   echo -n "${SLACK_BOT_TOKEN}" | \
     gcloud secrets versions add "${SECRET_NAME}" --data-file=- --quiet
 else
-  # Create the secret
   echo -n "${SLACK_BOT_TOKEN}" | \
     gcloud secrets create "${SECRET_NAME}" \
       --data-file=- \
@@ -109,7 +65,7 @@ else
 fi
 echo "   Token stored as secret '${SECRET_NAME}'"
 
-# ── 6. Create / update the Cloud Run Job ───────────────────
+# ── 4. Create / update the Cloud Run Job ───────────────────
 echo "▶  Deploying Cloud Run Job '${JOB_NAME}'…"
 if gcloud run jobs describe "${JOB_NAME}" --region="${REGION}" --quiet 2>/dev/null; then
   VERB="update"
@@ -120,7 +76,7 @@ fi
 gcloud run jobs "${VERB}" "${JOB_NAME}" \
   --image="${IMAGE}" \
   --region="${REGION}" \
-  --service-account="${SA_EMAIL}" \
+  --service-account="${DEFAULT_SA}" \
   --set-secrets="SLACK_BOT_TOKEN=${SECRET_NAME}:latest" \
   --set-env-vars="SLACK_CHANNEL=${SLACK_CHANNEL},BQ_PROJECT=${PROJECT_ID},BQ_DATASET=pendolytics_core_views" \
   --max-retries=2 \
@@ -129,18 +85,8 @@ gcloud run jobs "${VERB}" "${JOB_NAME}" \
   --cpu=1 \
   --quiet
 
-# ── 7. Cloud Scheduler trigger ─────────────────────────────
+# ── 5. Cloud Scheduler trigger ─────────────────────────────
 echo "▶  Setting up Cloud Scheduler job…"
-SCHEDULER_SA="${SA_EMAIL}"
-
-# Grant the SA permission to invoke the Cloud Run Job
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/run.invoker" \
-  --quiet
-
-JOB_RESOURCE="projects/${PROJECT_ID}/locations/${REGION}/jobs/${JOB_NAME}"
-
 if gcloud scheduler jobs describe "${JOB_NAME}-trigger" \
      --location="${REGION}" --quiet 2>/dev/null; then
   gcloud scheduler jobs update http "${JOB_NAME}-trigger" \
@@ -149,7 +95,7 @@ if gcloud scheduler jobs describe "${JOB_NAME}-trigger" \
     --time-zone="${SCHEDULE_TZ}" \
     --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run" \
     --message-body="{}" \
-    --oauth-service-account-email="${SCHEDULER_SA}" \
+    --oauth-service-account-email="${DEFAULT_SA}" \
     --quiet
 else
   gcloud scheduler jobs create http "${JOB_NAME}-trigger" \
@@ -158,7 +104,7 @@ else
     --time-zone="${SCHEDULE_TZ}" \
     --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run" \
     --message-body="{}" \
-    --oauth-service-account-email="${SCHEDULER_SA}" \
+    --oauth-service-account-email="${DEFAULT_SA}" \
     --quiet
 fi
 
