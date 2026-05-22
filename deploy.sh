@@ -61,11 +61,12 @@ gcloud artifacts repositories create cloud-run-jobs \
   --description="Cloud Run job images" \
   --quiet
 
-# ── 3. Build & push image ──────────────────────────────────
-echo "▶  Building and pushing Docker image…"
-gcloud builds submit . \
-  --tag="${IMAGE}" \
+# ── 3. Build & push image (pulls source from GitHub, no GCS staging needed) ─
+echo "▶  Building and pushing Docker image via Cloud Build…"
+gcloud builds submit --no-source \
+  --config=cloudbuild.yaml \
   --region="${REGION}" \
+  --substitutions="_IMAGE=${IMAGE}" \
   --quiet
 
 # ── 4. Service account ─────────────────────────────────────
