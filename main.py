@@ -1,11 +1,8 @@
 """
 Stage Regression Alerter — Cloud Run Job entrypoint.
 
-First run  (no rows in audit table): queries all regressions from WINDOW_START → today.
-Daily runs (audit table has prior rows): queries only today.
-
-State is stored in BQ (gtmaa_testing.stage_regression_alerts) so it survives
-Cloud Run's ephemeral container lifecycle.
+Runs daily. Queries opportunity_time_series for today's date only,
+detecting any opportunities whose stage_number dropped vs yesterday.
 """
 
 import os
@@ -13,10 +10,8 @@ import sys
 import logging
 from datetime import date
 
-from google.cloud import bigquery
-
-from bq_query import fetch_regressions, WINDOW_START
-from bq_logger import log_regressions, _TABLE
+from bq_query import fetch_regressions
+from bq_logger import log_regressions
 from slack_client import post_regressions
 
 logging.basicConfig(
@@ -27,15 +22,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 REQUIRED_ENV = ["SLACK_BOT_TOKEN", "SLACK_CHANNEL"]
-
-
-def _is_first_run(bq_project: str) -> bool:
-    """Return True if the audit table has no previous runs."""
-    client = bigquery.Client(project=bq_project)
-    rows = list(client.query(
-        f"SELECT 1 FROM `{_TABLE}` LIMIT 1"
-    ).result())
-    return len(rows) == 0
 
 
 def main() -> None:
@@ -49,29 +35,22 @@ def main() -> None:
     slack_token   = os.environ["SLACK_BOT_TOKEN"]
     slack_channel = os.environ["SLACK_CHANNEL"]
 
-    today     = date.today()
-    first_run = _is_first_run(bq_project)
+    today = date.today()
+    log.info("Running regression check for %s", today)
 
-    if first_run:
-        start_date = date.fromisoformat(WINDOW_START)
-        log.info("First run — querying all regressions from %s → %s", start_date, today)
-    else:
-        start_date = today
-        log.info("Daily run — querying regressions for %s", today)
-
-    regressions = fetch_regressions(bq_project, bq_dataset, start_date, today)
+    regressions = fetch_regressions(bq_project, bq_dataset, start_date=today, end_date=today)
     log.info("Found %d regression(s)", len(regressions))
 
     post_regressions(
         slack_token,
         slack_channel,
         regressions,
-        start_date=start_date,
+        start_date=today,
         end_date=today,
-        first_run=first_run,
+        first_run=False,
     )
 
-    log_regressions(bq_project, regressions, run_date=today, first_run=first_run)
+    log_regressions(bq_project, regressions, run_date=today, first_run=False)
     log.info("Done")
 
 
